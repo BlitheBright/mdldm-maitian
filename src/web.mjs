@@ -1,7 +1,9 @@
 // 麦田：本地网页。播种（发布）、长势（流量）、收成（转化）、粮仓（档案）
 import http from 'node:http'; import crypto from 'node:crypto'; import fs from 'node:fs'; import path from 'node:path'; import { spawn, execFileSync } from 'node:child_process'; import { fileURLToPath } from 'node:url';
-import { db, NAMES, STATE_CN, episodes, getEpisode, getTasks, recentLogs, getSnapshot, getMeta } from './db.mjs';
+import { db, NAMES, STATE_CN, episodes, getEpisode, getTasks, recentLogs, getSnapshot, getMeta, setMeta, setTask, log, saveMetric, prevMetric } from './db.mjs';
 import { config } from './feishu.mjs';
+import * as drv from './driver.mjs';
+import { collectors } from './metrics.mjs';
 import { SITE } from './site.mjs';
 import { learnOn, learnUrl } from './learn.mjs';
 import { review } from './review.mjs';
@@ -26,10 +28,39 @@ function episodeView(ep, full = false) {
     const p = pj.platforms[t.platform] || {};
     return { platform: t.platform, name: NAMES[t.platform] || t.platform, state: t.state, stateCn: STATE_CN[t.state] || t.state, detail: t.detail || '', url: t.url || '', updatedAt: t.updated_at,
       m: m && { day: m.day, views: m.views, likes: m.likes, comments: m.comments, favorites: m.favorites, shares: m.shares, extra: JSON.parse(m.extra || '{}') },
+      publishedAt: t.published_at || p.published_at || '', publishedTitle: t.published_title || p.published_title || '',
       ...(full ? { copy: { title: p.title || p.shortTitle || '', body: p.desc || p.body || p.text || p.description || '', tags: p.tags || p.topics || [], covers: p.covers || [] }, shot: fs.existsSync(path.join(ep.dir, '发布档案', `${t.platform}.jpg`)) } : {}) };
   });
-  const out = { id: ep.id, episode: ep.episode, name: ep.name, short: short(ep.name), nick: nickOf(ep.name, pj), schedule: ep.schedule, createdAt: ep.created_at, dir: ep.dir,
-    campaign: (JSON.stringify(pj.platforms).match(/utm_campaign=([\w-]+)/) || [])[1] || '', covers: Object.keys(pj.covers || {}), durationSec: pj.durationSec || 0, tasks, views, inter };
+  // 封面缓存版本号：封面文件被替换（同 URL、新内容）时改 v，避免浏览器继续用旧的占位图
+  const covers = Object.keys(pj.covers || {});
+  let coverMtime = 0, coverSize = 0;
+  for (const k of covers) { try { const s = fs.statSync(path.join(ep.dir, pj.covers[k])); coverMtime = Math.max(coverMtime, Math.round(s.mtimeMs)); coverSize += s.size; } catch {} }
+  const coverVer = coverMtime ? Math.round(coverMtime / 1000).toString(36) + '-' + coverSize.toString(36) : '';
+  // 实际发布时间：取各平台 published_at 里最早的一个（北京时间），没有就退回计划时间。
+  // 视频号常在正式发布前一晚先发（第 18 期：视频号 11/17 23:03 先发，B站/小红书 11/18 才铺），
+  // 它的时间照实记在 platforms.channels.published_at 里，但不参与这个锚点，否则整期会回退到前一天。
+  const MAIN_PLAT = ['douyin', 'bilibili', 'xhs', 'youtube', 'x', 'instagram', 'zsz'];
+  const when = (raw) => {
+    if (!raw) return NaN;
+    const s = String(raw);
+    const x = s.replace(' ', 'T');
+    return Date.parse(/[zZ]$|[+-]\d\d:?\d\d$/.test(x) ? x : x + (x.length === 16 ? ':00+08:00' : '+08:00')); 
+  };
+  // 公众号常比国内四家晚一天单独群发（第 19 期：四家 11/19，公众号 11/20），它的发布时间不参与这一期的定位，
+  // 否则整期会被拖到公众号那天，日历上就看不见四家真正发布的那一天。
+  const ANCHOR_PLAT = new Set([...MAIN_PLAT, 'channels']);
+  let firstPublish = 0, anyPublish = 0;
+  for (const [pid, p] of Object.entries(pj.platforms || {})) {
+    const t = when(p && p.published_at);
+    if (!Number.isFinite(t)) continue;
+    if (ANCHOR_PLAT.has(pid) && (!anyPublish || t < anyPublish)) anyPublish = t;   // 兜底：只有视频号发过也照样定位
+    if (MAIN_PLAT.includes(pid) && (!firstPublish || t < firstPublish)) firstPublish = t;
+  }
+  const fallback = Object.entries(pj.platforms || {}).filter(([, p]) => !p.skip).map(([, p]) => when(p.published_at)).filter(Number.isFinite);
+  const publishMs = firstPublish || anyPublish || (fallback.length ? Math.min(...fallback) : 0);
+  const publishAt = publishMs ? new Date(publishMs).toISOString() : '';
+  const out = { id: ep.id, episode: ep.episode, name: ep.name, short: short(ep.name), nick: nickOf(ep.name, pj), schedule: ep.schedule, publishAt, createdAt: ep.created_at, dir: ep.dir,
+    campaign: (JSON.stringify(pj.platforms).match(/utm_campaign=([\w-]+)/) || [])[1] || '', covers, coverVer, durationSec: pj.durationSec || 0, tasks, views, inter };
   if (full) {
     out.logs = recentLogs(ep.id, 200);
     out.metrics = db.prepare('SELECT day, platform, views, likes, comments, favorites, shares FROM metrics WHERE episode_id=? ORDER BY day').all(ep.id);
@@ -60,7 +91,7 @@ function widgetScript(req, file) {
 const latestPublished = () => episodes().filter(e => e.schedule && Date.parse(e.schedule) <= Date.now()).sort((a, b) => Date.parse(b.schedule) - Date.parse(a.schedule))[0];
 // 手机小组件：只读汇总（粉丝、涨幅、最新一期播放、站点近 7 天），用单独的 config.web.widgetToken，只能读这一个接口
 function widgetData() {
-  const ORDER = ['bilibili', 'douyin', 'xhs', 'channels', 'youtube', 'x', 'instagram'];
+  const ORDER = ['bilibili', 'douyin', 'xhs', 'channels', 'wechat', 'youtube', 'x', 'instagram'];
   const rows = db.prepare("SELECT day, platform, total FROM followers WHERE day >= date('now','localtime','-40 day') AND total IS NOT NULL ORDER BY day").all();
   const by = {}; for (const r of rows) (by[r.platform] ||= []).push(r);
   const today = new Date().toLocaleDateString('sv-SE');
@@ -136,15 +167,80 @@ async function handle(req, res) {
     if (!W.widgetToken) return send(res, 404, '<meta charset="utf-8">没配 config.web.widgetToken', 'text/html; charset=utf-8');
     return send(res, 200, widgetPage(widgetScript(req, 'maitian-loader.js')), 'text/html; charset=utf-8');
   }
-  if (u.pathname === '/api/overview') {
+  const LPAGES = {
+  bilibili: 'https://member.bilibili.com/platform/upload/video/frame',
+  xhs: 'https://creator.xiaohongshu.com/publish/publish?source=official&target=video',
+  douyin: 'https://creator.douyin.com/creator-micro/content/upload',
+  channels: 'https://channels.weixin.qq.com/platform/post/create',
+  wechat: 'https://mp.weixin.qq.com/',
+  youtube: 'https://studio.youtube.com/',
+  x: 'https://x.com/home',
+  instagram: 'https://www.instagram.com/',
+};
+const ALL_PLATFORMS = Object.keys(LPAGES);
+const ACTIONS_LABELS = { checkLogin: '检查平台登录', openLogin: '打开登录页', platformOff: '停用平台', platformOn: '启用平台', archiveCollect: '一键采集档案' };
+
+async function checkPlatformLogins(platforms) {
+  const results = {};
+  const now = new Date().toISOString();
+  for (const p of platforms) {
+    try {
+      const r = await drv.checkLogin([p]);
+      results[p] = { ok: r[p]?.ok ?? false, ts: now, detail: r[p]?.reason || '' };
+    } catch (e) {
+      results[p] = { ok: false, ts: now, detail: e.message };
+    }
+    setMeta(`loginCheck:${p}`, JSON.stringify(results[p]));
+  }
+  return results;
+}
+
+async function openLoginPages(platforms) {
+  const urls = platforms.map(p => LPAGES[p]).filter(Boolean);
+  if (urls.length) await drv.openForLogin(urls);
+}
+
+// 一键采集档案：遍历所有已登记期数，对每个已发布平台调用与 hub 同一套 collectors，
+// 落库 saveMetric + 记 log。返回日报文字。停用平台不采。
+async function collectArchive() {
+  const day = new Date(Date.now() + 8 * 3600e3).toISOString().slice(0, 10);
+  const off = new Set(ALL_PLATFORMS.filter(p => getMeta(`platformOff:${p}`) === '1'));
+  await drv.ensure();
+  const parts = [];
+  for (const ep of episodes()) {
+    const snap = getSnapshot(ep.id), pj = (snap && JSON.parse(snap.project)) || readPj(ep.dir) || { platforms: {} };
+    const lines = []; let total = 0, totalDelta = 0, any = false;
+    for (const t of getTasks(ep.id)) {
+      const fn = collectors[t.platform], p = pj.platforms[t.platform];
+      if (!fn || !p || off.has(t.platform)) continue;
+      if (t.state !== 'published') continue;
+      let m = null;
+      try { m = await fn({ url: t.url, p, detail: t.detail }); } catch (e) { log(ep.id, t.platform, 'metrics-error', e.message); }
+      if (!m) { lines.push(`${NAMES[t.platform]}：没读到`); continue; }      saveMetric(day, ep.id, t.platform, m);
+      any = true;
+      const prv = prevMetric(ep.id, t.platform, day);
+      const d = prv && m.views != null && prv.views != null ? m.views - prv.views : null;
+      total += m.views || 0; totalDelta += d || 0;
+      const f = (k, v) => v == null ? '' : `｜${k} ${v}`;
+      lines.push(`${NAMES[t.platform]}：播放 ${m.views ?? '-'}${d != null ? `（${d >= 0 ? '+' : ''}${d}）` : ''}${f('赞', m.likes)}${f('评', m.comments)}${f('藏', m.favorites)}${f('转', m.shares)}${Object.entries(m.extra || {}).filter(([, v]) => v).map(([k, v]) => f(k, v)).join('')}`);
+      await drv.sleep(3000);
+    }
+    if (lines.length) parts.push(`【${ep.episode ? ep.episode + ' 期 ' : ''}${short(ep.name)}】${any ? `全平台播放 ${total}${totalDelta ? `（较上次 +${totalDelta}）` : ''}` : ''}\n${lines.join('\n')}`);
+  }
+  setMeta('metricsDay', day);
+  if (parts.length) log('', '', 'archive-collect', `${parts.length} 期，${day}`);
+  return parts.length ? parts.join('\n\n') : '没有已发布的平台可采集';
+}
+
+if (u.pathname === '/api/overview') {
     return send(res, 200, { name: config.name || '麦田', siteOn: !!SITE, learn: learnOn(config) ? learnUrl('maitian-board') : '', siteName: SITE ? SITE.name : '', siteLogo: !!(SITE && config.site.logo), board: config.board && config.board.url, driver: config.driver,
       episodes: episodes().sort((a, b) => (b.episode || 0) - (a.episode || 0)).map(e => episodeView(e)), actions: actions.slice(-8).reverse(),
       site: { days: db.prepare('SELECT * FROM site_daily ORDER BY day').all(), channels: db.prepare('SELECT * FROM site_channels ORDER BY revenue DESC').all(),
         campaigns: db.prepare('SELECT * FROM site_campaigns ORDER BY reg DESC').all(), campaignsOn: getMeta('siteCampaigns') === 'on' },
-      metrics: db.prepare('SELECT day, episode_id, platform, views FROM metrics ORDER BY day').all(),
+      metrics: db.prepare('SELECT day, episode_id, platform, views, likes, comments, favorites, shares FROM metrics ORDER BY day').all(),
       followers: db.prepare("SELECT day, platform, total, gain, loss, source FROM followers WHERE day >= date('now','localtime','-40 day') ORDER BY day").all(),
       samples: db.prepare('SELECT ts, episode_id, platform, views FROM samples ORDER BY ts').all(),
-      feed: feed(), health: { nas: fs.existsSync(config.rootPath), chrome: await chromeUp(), metricsDay: getMeta('metricsDay') || '', doctorDay: getMeta('doctorDay') || '', login: Object.fromEntries((config.keepAlive || []).map(k => [k, getMeta(`login:${k}`) || '']) ) }, now: new Date().toISOString() });
+      feed: feed(), health: { nas: fs.existsSync(config.rootPath), chrome: await chromeUp(), metricsDay: getMeta('metricsDay') || '', doctorDay: getMeta('doctorDay') || '', login: Object.fromEntries((config.keepAlive || []).map(k => [k, getMeta(`login:${k}`) || '']) ), loginAll: Object.fromEntries(ALL_PLATFORMS.map(p => [p, (() => { try { return JSON.parse(getMeta(`loginCheck:${p}`) || '{}'); } catch { return {}; } })()])), platformOff: Object.fromEntries(ALL_PLATFORMS.map(p => [p, getMeta(`platformOff:${p}`) === '1']) ) }, now: new Date().toISOString() });
   }
   if (u.pathname === '/site-logo') { const f = SITE && config.site.logo && path.resolve(ROOT, config.site.logo); return f && fs.existsSync(f) ? send(res, 200, fs.readFileSync(f), /\.svg$/.test(f) ? 'image/svg+xml' : /\.jpe?g$/.test(f) ? 'image/jpeg' : 'image/png', { 'cache-control': 'max-age=3600' }) : send(res, 404, ''); }
   if (u.pathname === '/api/episode') { const ep = getEpisode(u.searchParams.get('id')); return ep ? send(res, 200, episodeView(ep, true)) : send(res, 404, { error: '没有这一期' }); }
@@ -161,6 +257,46 @@ async function handle(req, res) {
   if (u.pathname === '/api/action' && req.method === 'POST') {
     let body = ''; req.on('data', d => body += d); req.on('end', () => {
       let a; try { a = JSON.parse(body); } catch { return send(res, 400, { error: '请求格式不对' }); }
+      // 平台卡片：直接用 Node API（不经过 hub.mjs 子进程）
+      if (a.type === 'checkLogin') {
+        const platforms = a.platform ? [a.platform] : ALL_PLATFORMS.filter(p => getMeta(`platformOff:${p}`) !== '1');
+        if (!platforms.length) return send(res, 400, { error: '没有启用的平台' });
+        const rec = { type: a.type, label: `${ACTIONS_LABELS.checkLogin}${a.platform ? ` · ${NAMES[a.platform] || a.platform}` : ''}`, startedAt: new Date().toISOString(), done: false, ok: null, tail: '' };
+        actions.push(rec);
+        send(res, 200, { ok: true });
+        checkPlatformLogins(platforms).then(() => { rec.done = true; rec.ok = true; }).catch(e => { rec.done = true; rec.ok = false; rec.tail = e.message; });
+        return;
+      }
+      if (a.type === 'openLogin') {
+        const platforms = a.platform ? [a.platform] : ALL_PLATFORMS.filter(p => getMeta(`platformOff:${p}`) !== '1');
+        if (!platforms.length) return send(res, 400, { error: '没有启用的平台' });
+        const rec = { type: a.type, label: `${ACTIONS_LABELS.openLogin}${a.platform ? ` · ${NAMES[a.platform] || a.platform}` : ''}`, startedAt: new Date().toISOString(), done: false, ok: null, tail: '' };
+        actions.push(rec);
+        send(res, 200, { ok: true });
+        openLoginPages(platforms).then(() => { rec.done = true; rec.ok = true; }).catch(e => { rec.done = true; rec.ok = false; rec.tail = e.message; });
+        return;
+      }
+      if (a.type === 'archiveCollect') {
+        const rec = { type: a.type, label: ACTIONS_LABELS.archiveCollect, startedAt: new Date().toISOString(), done: false, ok: null, tail: '' };
+        actions.push(rec);
+        send(res, 200, { ok: true });
+        collectArchive().then((out) => { rec.done = true; rec.ok = true; rec.tail = out; }).catch(e => { rec.done = true; rec.ok = false; rec.tail = e.message; });
+        return;
+      }
+      if (a.type === 'platformOn' && !a.platform) {
+        for (const p of ALL_PLATFORMS) setMeta(`platformOff:${p}`, '');
+        const rec = { type: a.type, label: '全部恢复', startedAt: new Date().toISOString(), done: true, ok: true, tail: '' };
+        actions.push(rec);
+        return send(res, 200, { ok: true });
+      }
+      if (a.type === 'platformOff' || a.type === 'platformOn') {
+        if (!a.platform || !ALL_PLATFORMS.includes(a.platform)) return send(res, 400, { error: '平台不对' });
+        const off = a.type === 'platformOff' ? '1' : '';
+        setMeta(`platformOff:${a.platform}`, off);
+        const rec = { type: a.type, label: `${off ? '停用' : '启用'}平台 · ${NAMES[a.platform] || a.platform}`, startedAt: new Date().toISOString(), done: true, ok: true, tail: '' };
+        actions.push(rec);
+        return send(res, 200, { ok: true });
+      }
       const map = { sync: ['sync', a.id], metrics: a.id ? ['metrics', a.id] : ['metrics'], doctor: ['doctor', '--notify'], board: ['board'], followers: ['followers'],
         mark: ['mark', a.id, a.platform, a.state, a.note || '在麦田里标记', ...(a.url ? ['--url', a.url] : [])] };
       const argv = map[a.type];
